@@ -92,4 +92,65 @@ public class StatsCollector {
         }
         System.out.println("╚══════════════════════════════════════════╝\n");
     }
+
+    /**
+     * 获取统计数据（用于 Web API）
+     */
+    public StatsData getStatsData() {
+        long total   = totalRequests.get();
+        long hits    = cacheHits.get();
+        long misses  = cacheMisses.get();
+        long blocked = blockedCount.get();
+        long cacheable = hits + misses;
+        double hitRate = cacheable > 0 ? hits * 100.0 / cacheable : 0.0;
+
+        // 获取热门资源 TOP 5
+        List<Map.Entry<String, AtomicLong>> sorted = new ArrayList<>(urlHits.entrySet());
+        sorted.sort(Comparator.comparingLong(e -> -e.getValue().get()));
+        
+        List<ResourceInfo> topResources = new ArrayList<>();
+        int rank = 1;
+        for (Map.Entry<String, AtomicLong> e : sorted) {
+            if (rank > 5) break;
+            topResources.add(new ResourceInfo(e.getKey(), e.getValue().get()));
+            rank++;
+        }
+
+        return new StatsData(total, hits, misses, blocked, hitRate, topResources);
+    }
+
+    /**
+     * 统计数据封装类
+     */
+    public static class StatsData {
+        public final long totalRequests;
+        public final long cacheHits;
+        public final long cacheMisses;
+        public final long blockedCount;
+        public final double hitRate;
+        public final List<ResourceInfo> topResources;
+
+        public StatsData(long totalRequests, long cacheHits, long cacheMisses,
+                        long blockedCount, double hitRate, List<ResourceInfo> topResources) {
+            this.totalRequests = totalRequests;
+            this.cacheHits = cacheHits;
+            this.cacheMisses = cacheMisses;
+            this.blockedCount = blockedCount;
+            this.hitRate = hitRate;
+            this.topResources = topResources;
+        }
+    }
+
+    /**
+     * 资源访问信息
+     */
+    public static class ResourceInfo {
+        public final String url;
+        public final long count;
+
+        public ResourceInfo(String url, long count) {
+            this.url = url;
+            this.count = count;
+        }
+    }
 }

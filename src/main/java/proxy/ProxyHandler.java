@@ -4,6 +4,7 @@ import cache.CacheEntry;
 import cache.CacheManager;
 import filter.AccessController;
 import filter.HeaderModifier;
+import filter.RateLimiter;
 import log.ProxyLogger;
 import log.StatsCollector;
 import model.HttpRequest;
@@ -26,16 +27,19 @@ public class ProxyHandler implements Runnable {
     private final Socket clientSocket;
     private final CacheManager cacheManager;
     private final AccessController accessController;
-    private final HeaderModifier headerModifier;   // 拓展功能 E
+    private final HeaderModifier headerModifier;
+    private final RateLimiter rateLimiter;   // 拓展功能：频率限制
 
     public ProxyHandler(Socket clientSocket,
                         CacheManager cacheManager,
                         AccessController accessController,
-                        HeaderModifier headerModifier) {
+                        HeaderModifier headerModifier,
+                        RateLimiter rateLimiter) {
         this.clientSocket     = clientSocket;
         this.cacheManager     = cacheManager;
         this.accessController = accessController;
         this.headerModifier   = headerModifier;
+        this.rateLimiter      = rateLimiter;
     }
 
     @Override
@@ -59,13 +63,21 @@ public class ProxyHandler implements Runnable {
 
         System.out.println("[请求] " + request.getMethod() + " " + request.getUrl());
 
+        // 拓展功能：频率限制检查
+        String clientIp = getClientIp();
+        if (!rateLimiter.allowRequest(clientIp)) {
+            sendRateLimitedResponse(clientOut);
+            StatsCollector.INSTANCE.record(request.getUrl(), false, true);
+            return;
+        }
+
         String host = extractHost(request);
 
-        // 黑名单检查
+        // 黑名单/白名单检查
         if (!accessController.isAllowed(host)) {
             sendBlockedResponse(clientOut, host);
             ProxyLogger.log(request.getMethod(), request.getUrl(), 403, false);
-            StatsCollector.INSTANCE.record(request.getUrl(), false, true);  // C
+            StatsCollector.INSTANCE.record(request.getUrl(), false, true);
             return;
         }
 
@@ -73,6 +85,18 @@ public class ProxyHandler implements Runnable {
             handleConnect(clientSocket, request.getUrl());
         } else {
             handleHttpRequest(request, clientOut);
+        }
+    }
+
+    /**
+     * 获取客户端 IP 地址
+     * 实际生产中可以从 Socket 获取真实 IP
+     */
+    private String getClientIp() {
+        try {
+            return clientSocket.getInetAddress().getHostAddress();
+        } catch (Exception e) {
+            return "unknown";
         }
     }
 
@@ -152,7 +176,7 @@ public class ProxyHandler implements Runnable {
                 clientOut.write(cached.getResponseBytes());
                 clientOut.flush();
                 ProxyLogger.log(method, url, 200, true);
-                StatsCollector.INSTANCE.record(url, true, false);  // C
+                StatsCollector.INSTANCE.record(url, true, false);
                 return;
             }
         }
@@ -191,12 +215,12 @@ public class ProxyHandler implements Runnable {
             }
 
             ProxyLogger.log(method, url, 200, false);
-            StatsCollector.INSTANCE.record(url, false, false);  // C
+            StatsCollector.INSTANCE.record(url, false, false);
 
         } catch (IOException e) {
             sendErrorResponse(clientOut, 502, "Bad Gateway - 无法连接到目标服务器");
             ProxyLogger.log(method, url, 502, false);
-            StatsCollector.INSTANCE.record(url, false, false);  // C
+            StatsCollector.INSTANCE.record(url, false, false);
         }
     }
 
@@ -248,13 +272,13 @@ public class ProxyHandler implements Runnable {
             }
 
             ProxyLogger.log("CONNECT", hostPort, 200, false);
-            StatsCollector.INSTANCE.record(hostPort, false, false);  // C
+            StatsCollector.INSTANCE.record(hostPort, false, false);
 
         } catch (IOException e) {
             System.err.println("[HTTPS] 隧道建立失败：" + e.getMessage());
             sendConnectFailed(clientSocket);
             ProxyLogger.log("CONNECT", hostPort, 502, false);
-            StatsCollector.INSTANCE.record(hostPort, false, false);  // C
+            StatsCollector.INSTANCE.record(hostPort, false, false);
         } finally {
             if (serverSocket != null) {
                 try { serverSocket.close(); } catch (IOException ignored) {}
@@ -300,6 +324,21 @@ public class ProxyHandler implements Runnable {
                 + "<p>访问 " + host + " 已被代理服务器拦截</p></body></html>";
         String response = "HTTP/1.1 403 Forbidden\r\n"
                 + "Content-Type: text/html; charset=UTF-8\r\n"
+                + "Content-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n"
+                + "\r\n" + body;
+        out.write(response.getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    /**
+     * 发送频率限制响应（HTTP 429）
+     */
+    private void sendRateLimitedResponse(OutputStream out) throws IOException {
+        String body = "<html><body><h1>429 Too Many Requests</h1>"
+                + "<p>请求过于频繁，请稍后再试</p></body></html>";
+        String response = "HTTP/1.1 429 Too Many Requests\r\n"
+                + "Content-Type: text/html; charset=UTF-8\r\n"
+                + "Retry-After: 60\r\n"
                 + "Content-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n"
                 + "\r\n" + body;
         out.write(response.getBytes(StandardCharsets.UTF_8));

@@ -3,7 +3,9 @@ package proxy;
 import cache.CacheEntry;
 import cache.CacheManager;
 import filter.AccessController;
+import filter.HeaderModifier;
 import log.ProxyLogger;
+import log.StatsCollector;
 import model.HttpRequest;
 
 import java.io.ByteArrayOutputStream;
@@ -24,11 +26,16 @@ public class ProxyHandler implements Runnable {
     private final Socket clientSocket;
     private final CacheManager cacheManager;
     private final AccessController accessController;
+    private final HeaderModifier headerModifier;   // 拓展功能 E
 
-    public ProxyHandler(Socket clientSocket, CacheManager cacheManager, AccessController accessController) {
-        this.clientSocket = clientSocket;
-        this.cacheManager = cacheManager;
+    public ProxyHandler(Socket clientSocket,
+                        CacheManager cacheManager,
+                        AccessController accessController,
+                        HeaderModifier headerModifier) {
+        this.clientSocket     = clientSocket;
+        this.cacheManager     = cacheManager;
         this.accessController = accessController;
+        this.headerModifier   = headerModifier;
     }
 
     @Override
@@ -39,28 +46,26 @@ public class ProxyHandler implements Runnable {
         } catch (IOException e) {
             System.err.println("[Handler] 连接异常：" + e.getMessage());
         } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException ignored) {
-            }
+            try { clientSocket.close(); } catch (IOException ignored) {}
         }
     }
 
     private void handleRequest() throws IOException {
-        InputStream clientIn = clientSocket.getInputStream();
+        InputStream  clientIn  = clientSocket.getInputStream();
         OutputStream clientOut = clientSocket.getOutputStream();
 
         HttpRequest request = parseRequest(clientIn);
-        if (request == null) {
-            return;
-        }
+        if (request == null) return;
 
         System.out.println("[请求] " + request.getMethod() + " " + request.getUrl());
 
         String host = extractHost(request);
+
+        // 黑名单检查
         if (!accessController.isAllowed(host)) {
             sendBlockedResponse(clientOut, host);
             ProxyLogger.log(request.getMethod(), request.getUrl(), 403, false);
+            StatsCollector.INSTANCE.record(request.getUrl(), false, true);  // C
             return;
         }
 
@@ -71,17 +76,13 @@ public class ProxyHandler implements Runnable {
         }
     }
 
-    /** 从原始字节流读取请求行、请求头和请求体（避免 BufferedReader 吞掉 POST 体或 HTTPS 隧道数据） */
+    /** 从原始字节流读取请求行、请求头和请求体 */
     private HttpRequest parseRequest(InputStream in) throws IOException {
         String requestLine = readLine(in);
-        if (requestLine == null || requestLine.isEmpty()) {
-            return null;
-        }
+        if (requestLine == null || requestLine.isEmpty()) return null;
 
         String[] parts = requestLine.split(" ", 3);
-        if (parts.length < 3) {
-            return null;
-        }
+        if (parts.length < 3) return null;
 
         HttpRequest request = new HttpRequest();
         request.setMethod(parts[0]);
@@ -103,7 +104,6 @@ public class ProxyHandler implements Runnable {
         if (contentLength > 0) {
             request.setBody(readFixedLength(in, contentLength));
         }
-
         return request;
     }
 
@@ -120,20 +120,16 @@ public class ProxyHandler implements Runnable {
             }
             line.write(b);
         }
-        if (line.size() == 0) {
-            return null;
-        }
+        if (line.size() == 0) return null;
         return line.toString(StandardCharsets.ISO_8859_1.name());
     }
 
     private byte[] readFixedLength(InputStream in, int length) throws IOException {
-        byte[] body = new byte[length];
-        int total = 0;
+        byte[] body  = new byte[length];
+        int    total = 0;
         while (total < length) {
             int read = in.read(body, total, length - total);
-            if (read == -1) {
-                break;
-            }
+            if (read == -1) break;
             total += read;
         }
         if (total < length) {
@@ -146,28 +142,33 @@ public class ProxyHandler implements Runnable {
 
     private void handleHttpRequest(HttpRequest request, OutputStream clientOut) throws IOException {
         String method = request.getMethod();
-        String url = request.getUrl();
+        String url    = request.getUrl();
 
+        // 缓存命中（仅 GET）
         if ("GET".equalsIgnoreCase(method)) {
             CacheEntry cached = cacheManager.get(url);
-            if (cached != null && !cached.isExpired()) {
+            if (cached != null) {
                 System.out.println("[缓存] 命中：" + url);
                 clientOut.write(cached.getResponseBytes());
                 clientOut.flush();
                 ProxyLogger.log(method, url, 200, true);
+                StatsCollector.INSTANCE.record(url, true, false);  // C
                 return;
             }
         }
 
-        URL parsedUrl = new URL(url);
+        // 拓展功能 E：在转发前修改请求头
+        headerModifier.apply(request);
+
+        URL    parsedUrl  = new URL(url);
         String targetHost = parsedUrl.getHost();
-        int targetPort = parsedUrl.getPort() == -1 ? 80 : parsedUrl.getPort();
+        int    targetPort = parsedUrl.getPort() == -1 ? 80 : parsedUrl.getPort();
 
         try (Socket serverSocket = new Socket(targetHost, targetPort)) {
             serverSocket.setSoTimeout(TIMEOUT_MS);
 
             OutputStream serverOut = serverSocket.getOutputStream();
-            InputStream serverIn = serverSocket.getInputStream();
+            InputStream  serverIn  = serverSocket.getInputStream();
 
             serverOut.write(request.toForwardBytes());
             serverOut.flush();
@@ -190,10 +191,12 @@ public class ProxyHandler implements Runnable {
             }
 
             ProxyLogger.log(method, url, 200, false);
+            StatsCollector.INSTANCE.record(url, false, false);  // C
 
         } catch (IOException e) {
             sendErrorResponse(clientOut, 502, "Bad Gateway - 无法连接到目标服务器");
             ProxyLogger.log(method, url, 502, false);
+            StatsCollector.INSTANCE.record(url, false, false);  // C
         }
     }
 
@@ -216,23 +219,23 @@ public class ProxyHandler implements Runnable {
         try {
             serverSocket = new Socket(host, port);
             final Socket upstream = serverSocket;
+
             OutputStream clientOut = clientSocket.getOutputStream();
-            clientOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            clientOut.write("HTTP/1.1 200 Connection Established\r\n\r\n"
+                    .getBytes(StandardCharsets.ISO_8859_1));
             clientOut.flush();
 
             clientSocket.setSoTimeout(0);
             upstream.setSoTimeout(0);
 
-            InputStream clientIn = clientSocket.getInputStream();
-            InputStream serverIn = upstream.getInputStream();
+            InputStream  clientIn  = clientSocket.getInputStream();
+            InputStream  serverIn  = upstream.getInputStream();
             OutputStream serverOut = upstream.getOutputStream();
 
             Thread clientToServer = new Thread(
-                    () -> relay(clientIn, serverOut, upstream),
-                    "tunnel-c2s-" + host);
+                    () -> relay(clientIn, serverOut, upstream), "tunnel-c2s-" + host);
             Thread serverToClient = new Thread(
-                    () -> relay(serverIn, clientOut, clientSocket),
-                    "tunnel-s2c-" + host);
+                    () -> relay(serverIn, clientOut, clientSocket), "tunnel-s2c-" + host);
 
             clientToServer.start();
             serverToClient.start();
@@ -245,17 +248,16 @@ public class ProxyHandler implements Runnable {
             }
 
             ProxyLogger.log("CONNECT", hostPort, 200, false);
+            StatsCollector.INSTANCE.record(hostPort, false, false);  // C
 
         } catch (IOException e) {
             System.err.println("[HTTPS] 隧道建立失败：" + e.getMessage());
             sendConnectFailed(clientSocket);
             ProxyLogger.log("CONNECT", hostPort, 502, false);
+            StatsCollector.INSTANCE.record(hostPort, false, false);  // C
         } finally {
             if (serverSocket != null) {
-                try {
-                    serverSocket.close();
-                } catch (IOException ignored) {
-                }
+                try { serverSocket.close(); } catch (IOException ignored) {}
             }
         }
     }
@@ -270,42 +272,36 @@ public class ProxyHandler implements Runnable {
             }
         } catch (IOException ignored) {
         } finally {
-            try {
-                closeOnEnd.close();
-            } catch (IOException ignored) {
-            }
+            try { closeOnEnd.close(); } catch (IOException ignored) {}
         }
     }
 
     private void sendConnectFailed(Socket clientSocket) {
         try {
             OutputStream out = clientSocket.getOutputStream();
-            out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            out.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"
+                    .getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
-        } catch (IOException ignored) {
-        }
+        } catch (IOException ignored) {}
     }
 
     private String extractHost(HttpRequest request) {
         if ("CONNECT".equalsIgnoreCase(request.getMethod())) {
             String hostPort = request.getUrl();
-            int colonIdx = hostPort.lastIndexOf(':');
+            int colonIdx    = hostPort.lastIndexOf(':');
             return colonIdx > 0 ? hostPort.substring(0, colonIdx) : hostPort;
         }
-        try {
-            return new URL(request.getUrl()).getHost();
-        } catch (Exception e) {
-            return request.getUrl();
-        }
+        try { return new URL(request.getUrl()).getHost(); }
+        catch (Exception e) { return request.getUrl(); }
     }
 
     private void sendBlockedResponse(OutputStream out, String host) throws IOException {
-        String body = "<html><body><h1>403 Forbidden</h1><p>访问 " + host + " 已被代理服务器拦截</p></body></html>";
+        String body = "<html><body><h1>403 Forbidden</h1>"
+                + "<p>访问 " + host + " 已被代理服务器拦截</p></body></html>";
         String response = "HTTP/1.1 403 Forbidden\r\n"
                 + "Content-Type: text/html; charset=UTF-8\r\n"
                 + "Content-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n"
-                + "\r\n"
-                + body;
+                + "\r\n" + body;
         out.write(response.getBytes(StandardCharsets.UTF_8));
         out.flush();
     }
@@ -315,8 +311,7 @@ public class ProxyHandler implements Runnable {
         String response = "HTTP/1.1 " + code + " Error\r\n"
                 + "Content-Type: text/html; charset=UTF-8\r\n"
                 + "Content-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n"
-                + "\r\n"
-                + body;
+                + "\r\n" + body;
         out.write(response.getBytes(StandardCharsets.UTF_8));
         out.flush();
     }

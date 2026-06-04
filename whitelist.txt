@@ -1,0 +1,5 @@
+# 白名单域名，一行一个
+# 白名单模式下：只有这些网站可以访问
+www.baidu.com
+www.google.com
+example.com

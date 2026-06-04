@@ -53,7 +53,11 @@ public class Main {
                         new java.io.InputStreamReader(System.in));
                 System.out.println("（按回车键可随时打印当前统计）");
                 while (true) {
-                    br.readLine();
+                    String line = br.readLine();
+                    if (line == null) {
+                        // 无标准输入时（后台运行），退出循环避免无限打印
+                        break;
+                    }
                     StatsCollector.INSTANCE.printReport(server.getCacheManager().size());
                 }
             } catch (Exception ignored) {}
